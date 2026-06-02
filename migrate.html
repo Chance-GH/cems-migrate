@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CEMS Migration</title>
+<style>
+body{font-family:monospace;background:#0d0f14;color:#e8eaf0;padding:30px;max-width:800px;margin:0 auto;}
+h1{color:#e8a427;letter-spacing:2px;}
+.section{background:#161920;border:1px solid #2e3445;border-radius:8px;padding:20px;margin-bottom:20px;}
+label{display:block;font-size:11px;color:#7a8299;letter-spacing:1px;margin-bottom:6px;}
+input,textarea{width:100%;background:#0d0f14;border:1px solid #2e3445;color:#e8eaf0;padding:10px;border-radius:5px;font-family:monospace;font-size:13px;box-sizing:border-box;}
+textarea{height:120px;resize:vertical;}
+button{background:#e8a427;color:#0d0f14;border:none;padding:12px 24px;border-radius:5px;font-family:monospace;font-size:14px;font-weight:bold;cursor:pointer;margin-top:10px;letter-spacing:1px;}
+button:disabled{background:#2e3445;color:#7a8299;cursor:not-allowed;}
+#log{background:#0d0f14;border:1px solid #2e3445;border-radius:5px;padding:16px;height:400px;overflow-y:auto;font-size:12px;line-height:1.6;}
+.ok{color:#4ec98e;}
+.err{color:#e05252;}
+.info{color:#e8a427;}
+.dim{color:#7a8299;}
+</style>
+</head>
+<body>
+<h1>CEMS → SUPABASE MIGRATION</h1>
+
+<div class="section">
+  <label>SUPABASE URL</label>
+  <input id="url" value="https://btlqygqmcizwvnghdxtn.supabase.co" />
+  
+  <label style="margin-top:14px;">SUPABASE ANON KEY</label>
+  <input id="key" type="password" placeholder="Paste your anon public key here" />
+  
+  <label style="margin-top:14px;">PASTE YOUR cems_export.json CONTENTS HERE</label>
+  <textarea id="json" placeholder="Open cems_export.json in Notepad, select all (Ctrl+A), copy (Ctrl+C), paste here (Ctrl+V)"></textarea>
+  
+  <button id="btn" onclick="runMigration()">RUN MIGRATION</button>
+</div>
+
+<div class="section">
+  <div id="log"><span class="dim">Migration log will appear here...</span></div>
+</div>
+
+<script>
+const log = (msg, type='dim') => {
+  const el = document.getElementById('log');
+  el.innerHTML += `<div class="${type}">${msg}</div>`;
+  el.scrollTop = el.scrollHeight;
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function supabaseInsert(url, key, table, rows) {
+  if (!rows || rows.length === 0) return { count: 0 };
+  // Insert in batches of 50
+  let total = 0;
+  for (let i = 0; i < rows.length; i += 50) {
+    const batch = rows.slice(i, i + 50);
+    const res = await fetch(`${url}/rest/v1/${table}`, {
+      method: 'POST',
+      headers: {
+        'apikey': key,
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'return=minimal'
+      },
+      body: JSON.stringify(batch)
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`${table} batch ${i}: ${err}`);
+    }
+    total += batch.length;
+    await sleep(100);
+  }
+  return { count: total };
+}
+
+function cleanDate(val) {
+  if (!val) return null;
+  if (val instanceof Date) {
+    if (isNaN(val.getTime())) return null;
+    return val.toISOString().slice(0, 10);
+  }
+  const s = String(val).trim();
+  if (!s || s === '') return null;
+  // Try parsing various formats
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  return null;
+}
+
+function cleanNum(val) {
+  if (val === '' || val === null || val === undefined) return 0;
+  const n = parseFloat(val);
+  return isNaN(n) ? 0 : n;
+}
+
+function cleanBool(val) {
+  if (val === true || val === 'true' || val === 'TRUE') return true;
+  return false;
+}
+
+function genId() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
+async function runMigration() {
+  const url = document.getElementById('url').value.trim();
+  const key = document.getElementById('key').value.trim();
+  const jsonText = document.getElementById('json').value.trim();
+
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('btn').disabled = true;
+
+  if (!url || !key) { log('ERROR: Missing URL or API key', 'err'); document.getElementById('btn').disabled = false; return; }
+  if (!jsonText) { log('ERROR: No JSON data pasted', 'err'); document.getElementById('btn').disabled = false; return; }
+
+  let data;
+  try {
+    data = JSON.parse(jsonText);
+    log('✓ JSON parsed successfully', 'ok');
+  } catch(e) {
+    log('ERROR parsing JSON: ' + e.message, 'err');
+    document.getElementById('btn').disabled = false;
+    return;
+  }
+
+  try {
+
+    // ── VALVES ──────────────────────────────────────────────────────────────
+    log('Migrating Valves...', 'info');
+    const valves = (data.Valves || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      valve_tag: r.valveTag || null,
+      valve_mfr: r.valveMfr || null,
+      actuator_type: r.actuatorType || null,
+      actuator_mfr: r.actuatorMfr || null,
+      hpu_mfr: r.hpuMfr || null,
+      accumulators: r.accumulators || null,
+      system_type: r.systemType || null,
+      conditioning_system: r.conditioningSystem || null,
+      hcu_mfr: r.hcuMfr || null,
+      control_type: r.controlType || null,
+      control_mfr: r.controlMfr || null,
+      hmi: r.hmi || null,
+      hmi_mfr: r.hmiMfr || null,
+      spare_parts: r.spareParts || null,
+      diagram_type: r.diagramType || null,
+      diagram_element: r.diagramElement || null,
+      components: r.components || null
+    })).filter(r => r.customer);
+    const vRes = await supabaseInsert(url, key, 'valves', valves);
+    log(`✓ Valves: ${vRes.count} rows`, 'ok');
+
+    // ── TURNAROUNDS ─────────────────────────────────────────────────────────
+    log('Migrating Turnarounds...', 'info');
+    const turnarounds = (data.Turnarounds || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      last_ta: cleanDate(r.lastTA),
+      next_ta: cleanDate(r.nextTA),
+      notes: r.notes || null
+    })).filter(r => r.customer);
+    const tRes = await supabaseInsert(url, key, 'turnarounds', turnarounds);
+    log(`✓ Turnarounds: ${tRes.count} rows`, 'ok');
+
+    // ── ACTION ITEMS ────────────────────────────────────────────────────────
+    log('Migrating Action Items...', 'info');
+    const actions = (data.ActionItems || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      action_text: r.actionText || null,
+      date_entered: cleanDate(r.dateEntered),
+      reminder_date: cleanDate(r.reminderDate)
+    })).filter(r => r.customer);
+    const aRes = await supabaseInsert(url, key, 'action_items', actions);
+    log(`✓ Action Items: ${aRes.count} rows`, 'ok');
+
+    // ── ACTION ARCHIVE ──────────────────────────────────────────────────────
+    log('Migrating Action Archive...', 'info');
+    const archive = (data.ActionArchive || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      action_text: r.actionText || null,
+      date_entered: cleanDate(r.dateEntered),
+      reminder_date: cleanDate(r.reminderDate),
+      date_completed: cleanDate(r.dateCompleted)
+    })).filter(r => r.customer);
+    const archRes = await supabaseInsert(url, key, 'action_archive', archive);
+    log(`✓ Action Archive: ${archRes.count} rows`, 'ok');
+
+    // ── CONTACTS ────────────────────────────────────────────────────────────
+    log('Migrating Contacts...', 'info');
+    const contacts = (data.Contacts || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      name: r.name || null,
+      title: r.title || null,
+      phone: r.phone || null,
+      email: r.email || null,
+      notes: r.notes || null
+    })).filter(r => r.customer);
+    const cRes = await supabaseInsert(url, key, 'contacts', contacts);
+    log(`✓ Contacts: ${cRes.count} rows`, 'ok');
+
+    // ── LOCATION NOTES ──────────────────────────────────────────────────────
+    log('Migrating Location Notes...', 'info');
+    const locNotes = (data.LocationNotes || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      notes: r.notes || null
+    })).filter(r => r.customer && r.notes);
+    const lnRes = await supabaseInsert(url, key, 'location_notes', locNotes);
+    log(`✓ Location Notes: ${lnRes.count} rows`, 'ok');
+
+    // ── MEETING NOTES ───────────────────────────────────────────────────────
+    log('Migrating Meeting Notes...', 'info');
+    const meetings = (data.MeetingNotes || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      meeting_date: cleanDate(r.meetingDate),
+      meeting_type: r.meetingType || null,
+      body: r.body || null,
+      archived: cleanBool(r.archived)
+    })).filter(r => r.customer && r.body);
+    const mRes = await supabaseInsert(url, key, 'meeting_notes', meetings);
+    log(`✓ Meeting Notes: ${mRes.count} rows`, 'ok');
+
+    // ── INTERNAL NOTES ──────────────────────────────────────────────────────
+    log('Migrating Internal Notes...', 'info');
+    const internalNotes = (data.InternalNotes || []).map(r => ({
+      id: String(r.id || genId()),
+      title: r.title || null,
+      category: r.category || null,
+      note_date: cleanDate(r.noteDate),
+      body: r.body || null,
+      archived: false
+    })).filter(r => r.title);
+    const inRes = await supabaseInsert(url, key, 'internal_notes', internalNotes);
+    log(`✓ Internal Notes: ${inRes.count} rows`, 'ok');
+
+    // ── PROPOSALS ───────────────────────────────────────────────────────────
+    log('Migrating Proposals...', 'info');
+    const proposals = (data.Proposals || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      description: r.description || null,
+      amount: cleanNum(r.amount),
+      status: r.status || 'Active',
+      ctrl_title: r.ctrlTitle || null,
+      ctrl_proposal_num: r.ctrlProposalNum || null,
+      ctrl_price: cleanNum(r.ctrlPrice),
+      ctrl_delivery: cleanDate(r.ctrlDelivery),
+      valve_title: r.valveTitle || null,
+      valve_proposal_num: r.valveProposalNum || null,
+      valve_price: cleanNum(r.valvePrice),
+      valve_delivery: cleanDate(r.valveDelivery),
+      follow_up_date: cleanDate(r.followUpDate),
+      win_prob: r.winProb ? parseInt(r.winProb) : null,
+      start_year: r.startYear ? parseInt(r.startYear) : null,
+      yr2025: cleanNum(r.yr2025),
+      yr2026: cleanNum(r.yr2026),
+      yr2027: cleanNum(r.yr2027),
+      yr2028: cleanNum(r.yr2028),
+      yr2029: cleanNum(r.yr2029),
+      yr2030: cleanNum(r.yr2030),
+      yr2031: cleanNum(r.yr2031),
+      yr2032: cleanNum(r.yr2032),
+      yr2033: cleanNum(r.yr2033),
+      yr2034: cleanNum(r.yr2034)
+    })).filter(r => r.customer);
+    const pRes = await supabaseInsert(url, key, 'proposals', proposals);
+    log(`✓ Proposals: ${pRes.count} rows`, 'ok');
+
+    // ── MSA RECORDS ─────────────────────────────────────────────────────────
+    log('Migrating MSA Records...', 'info');
+    const msa = (data.MSARecords || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      contact_name: r.contactName || null,
+      start_date: cleanDate(r.startDate),
+      expiry_date: cleanDate(r.expiryDate),
+      type: r.type || null,
+      notes: r.notes || null
+    })).filter(r => r.customer);
+    const msaRes = await supabaseInsert(url, key, 'msa_records', msa);
+    log(`✓ MSA Records: ${msaRes.count} rows`, 'ok');
+
+    // ── HPU COMPONENTS ──────────────────────────────────────────────────────
+    log('Migrating HPU Components...', 'info');
+    const hpu = (data.HPUComponents || []).map(r => ({
+      id: String(r.id || genId()),
+      customer: r.customer || null,
+      location: r.location || null,
+      unit: r.unit || null,
+      component_id: r.componentId || null,
+      component_label: r.componentLabel || null,
+      manufacturer: r.manufacturer || null,
+      model: r.model || null,
+      serial_number: r.serialNumber || null,
+      notes: r.notes || null
+    })).filter(r => r.customer);
+    const hpuRes = await supabaseInsert(url, key, 'hpu_components', hpu);
+    log(`✓ HPU Components: ${hpuRes.count} rows`, 'ok');
+
+    // ── FORECAST SNAPSHOTS ──────────────────────────────────────────────────
+    log('Migrating Forecast Snapshots...', 'info');
+    const snapshots = (data.ForecastSnapshots || []).map(r => ({
+      id: String(r.id || genId()),
+      label: r.label || null,
+      date_created: cleanDate(r.dateCreated),
+      ev_cur: cleanNum(r.ev_cur),
+      p10_cur: cleanNum(r.p10_cur),
+      p50_cur: cleanNum(r.p50_cur),
+      p90_cur: cleanNum(r.p90_cur),
+      ev_y1: cleanNum(r.ev_y1),
+      p10_y1: cleanNum(r.p10_y1),
+      p50_y1: cleanNum(r.p50_y1),
+      p90_y1: cleanNum(r.p90_y1),
+      ev_y2: cleanNum(r.ev_y2),
+      p10_y2: cleanNum(r.p10_y2),
+      p50_y2: cleanNum(r.p50_y2),
+      p90_y2: cleanNum(r.p90_y2),
+      proposal_snapshot: r.proposalSnapshot || null
+    })).filter(r => r.label);
+    const snapRes = await supabaseInsert(url, key, 'forecast_snapshots', snapshots);
+    log(`✓ Forecast Snapshots: ${snapRes.count} rows`, 'ok');
+
+    // ── PRODUCT REF ─────────────────────────────────────────────────────────
+    log('Migrating Product Ref...', 'info');
+    const products = (data.ProductRef || []).map(r => ({
+      id: String(r.id || genId()),
+      product_id: r.productId || null,
+      images_url: r.imagesUrl || null,
+      drawings_url: r.drawingsUrl || null,
+      specs_url: r.specsUrl || null
+    })).filter(r => r.product_id);
+    const prRes = await supabaseInsert(url, key, 'product_ref', products);
+    log(`✓ Product Ref: ${prRes.count} rows`, 'ok');
+
+    log('', 'dim');
+    log('════════════════════════════════════════', 'info');
+    log('✓ MIGRATION COMPLETE', 'ok');
+    log('════════════════════════════════════════', 'info');
+    log('All your data is now in Supabase.', 'ok');
+    log('You can verify it in the Supabase Table Editor.', 'dim');
+
+  } catch(e) {
+    log('ERROR: ' + e.message, 'err');
+    log('Check the table name and your API key and try again.', 'dim');
+  }
+
+  document.getElementById('btn').disabled = false;
+}
+</script>
+</body>
+</html>
